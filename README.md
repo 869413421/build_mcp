@@ -32,6 +32,9 @@ MCP有多火，已经不需要我再赘述。作为一项新兴技术，中文�
     - 电话：XXX
     - 营业时间：XXX
 
+#### 效果图
+![效果图](https://github.com/869413421/build_mcp/blob/main/docs/images/1.png）
+
 ---
 
 ## 核心 MCP 概念
