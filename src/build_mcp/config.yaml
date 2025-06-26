@@ -1,0 +1,14 @@
+# 高德地图API配置
+api_key: test
+# 高德地图API的基础URL
+base_url: https://restapi.amap.com
+# 代理设置
+proxy: http://127.0.0.1:10809
+# 日志等级
+log_level: INFO
+# 接口重试次数
+max_retries: 5
+# 接口重试间隔时间（秒）
+retry_delay: 1
+# 指数退避因子
+backoff_factor: 2
