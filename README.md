@@ -1,7 +1,10 @@
 # 工程化构建一个MCP服务，从开发调试到部署上线
 
 MCP有多火，已经不需要我再赘述。作为一项新兴技术，中文互联网上对如何开发MCP服务的资料多如牛毛，但大多数语焉不详或者浅尝辄止，大多数案例都是照搬官方文档的示例简述一下水文。
-作为一个开发者，我深知工程化的重要性。MCP服务的开发不仅仅是照猫画虎写两个服务接口那么简单，更需要考虑到代码结构、配置管理、日志记录、异常处理等方方面面。经过探索和实践，我希望将一个MCP服务的开发流程整理成了一份详尽的指南，希望能帮助更多的开发者快速上手并构建出高质量的MCP服务。
+
+作为一个开发者，我深知工程化的重要性。MCP服务的开发不仅仅是照猫画虎写两个服务接口那么简单，更需要考虑到代码结构、配置管理、日志记录、异常处理等方方面面。
+
+经过探索和实践，我希望将一个MCP服务的开发流程整理成了一份详尽的指南，希望能帮助更多的开发者快速上手并构建出高质量的MCP服务。
 
 ---
 
@@ -190,6 +193,8 @@ max_retries: 5
 retry_delay: 1
 # 指数退避因子
 backoff_factor: 2
+# 日志文件路径
+log_dir: /var/log/build_mcp
 ```
 
 ⚠ `config.yaml` 文件需要放在 `src/build_mcp/` 目录下，这样在加载配置时可以正确找到。
@@ -277,50 +282,53 @@ touch src/build_mcp/common/logger.py
 ```python
 # src/build_mcp/common/logger.py
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 
+from build_mcp.common.config import load_config
 
-def get_logger(
-        name: str = "default",
-        log_file: str = "app.log",
-        log_level=logging.INFO,
-        max_bytes=5 * 1024 * 1024,
-        backup_count=3
-) -> logging.Logger:
-    """
-    获取一个带文件和控制台输出的 logger。
-  
-    Args:
-        name (str): logger 名称
-        log_file (str): 日志文件路径
-        log_level (int): 日志等级，默认为 logging.INFO
-        max_bytes (int): 单个日志文件最大大小（默认 5MB）
-        backup_count (int): 日志文件保留份数
-    Returns:
-        logging.Logger: 配置好的 logger 实例
-    Example:
-        logger = get_logger("my_logger", "my_app.log", logging.DEBUG)
-        logger.info("This is an info message.")
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(log_level)
+config = load_config("config.yaml")
 
-    if not logger.hasHandlers():  # 避免重复添加 handler
-        # 控制台输出
-        console_handler = logging.StreamHandler()
-        console_formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s')
-        console_handler.setFormatter(console_formatter)
 
-        # 文件输出
-        file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding='utf-8')
-        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(file_formatter)
+def get_logger(name: str = "default", max_bytes=5 * 1024 * 1024, backup_count=3) -> logging.Logger:
+  """
+  获取一个带文件和控制台输出的 logger。
 
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
+  Args:
+      name (str): logger 名称，默认为 "default"。
+      max_bytes (int): 单个日志文件最大大小，默认为 5MB。
+      backup_count (int): 日志文件保留份数，默认为 3。
+  Returns:
+      logging.Logger: 配置好的 logger 实例。
+  Example:
+      logger = get_logger("my_logger")
+      logger.info("This is an info message.")
+  """
+  log_level = config.get("log_level", "INFO")
+  log_dir = config.get("log_dir", "./logs")
+  if isinstance(log_level, str):
+    log_level = getattr(logging, log_level.upper(), logging.INFO)
 
-    return logger
+  os.makedirs(log_dir, exist_ok=True)
+  log_file = os.path.join(log_dir, f"{name}.log")
 
+  logger = logging.getLogger(name)
+  logger.setLevel(log_level)
+  logger.propagate = False
+
+  if not logger.hasHandlers():
+    console_handler = logging.StreamHandler()
+    console_formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+
+    file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding='utf-8')
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+  logger.info(f"Logger 初始化完成，写入文件：{log_file}")
+  return logger
 ```
 
 目前为止，构建一个系统的基础模块已经构建完成。接下来我们将实现核心的服务功能。
@@ -352,188 +360,188 @@ import httpx
 
 
 class GdSDK:
+  """
+  GdSDK API 异步 SDK 封装。
+
+  支持自动重试，指数退避策略。
+
+  Args:
+      config (dict): 配置字典，示例：
+          {
+              "base_url": "https://restapi.amap.com",
+              "api_key": "your_api_key",
+              "proxies": {"http": "...", "https": "..."},  # 可选
+              "max_retries": 5,
+              "retry_delay": 1,
+              "backoff_factor": 2,
+          }
+      logger (logging.Logger, optional): 日志记录器，默认使用模块 logger。
+  """
+
+  def __init__(self, config: dict, logger=None):
+    self.api_key = config.get("api_key", "")
+    self.base_url = config.get("base_url", "").rstrip('/')
+    self.proxy = config.get("proxy", None)
+    self.logger = logger or logging.getLogger(__name__)
+    self.max_retries = config.get("max_retries", 5)
+    self.retry_delay = config.get("retry_delay", 1)
+    self.backoff_factor = config.get("backoff_factor", 2)
+
+    # 创建一个异步HTTP客户端，自动带上请求头和代理配置
+    self._client = httpx.AsyncClient(proxy=self.proxy, timeout=10)
+
+  async def __aenter__(self):
+    return self
+
+  async def __aexit__(self, exc_type, exc, tb):
+    await self._client.aclose()
+
+  def _should_retry(self, response: httpx.Response = None, exception: Exception = None) -> bool:
     """
-    GdSDK API 异步 SDK 封装。
-  
-    支持自动重试，指数退避策略。
-  
+    判断请求失败后是否应该重试。
+
     Args:
-        config (dict): 配置字典，示例：
-            {
-                "base_url": "https://restapi.amap.com",
-                "api_key": "your_api_key",
-                "proxies": {"http": "...", "https": "..."},  # 可选
-                "max_retries": 5,
-                "retry_delay": 1,
-                "backoff_factor": 2,
-            }
-        logger (logging.Logger, optional): 日志记录器，默认使用模块 logger。
+        response (httpx.Response, optional): HTTP 响应对象。
+        exception (Exception, optional): 请求异常。
+
+    Returns:
+        bool: 是否需要重试。
     """
+    if exception is not None:
+      # 网络异常等，建议重试
+      return True
 
-    def __init__(self, config: dict, logger=None):
-        self.api_key = config.get("api_key", "")
-        self.base_url = config.get("base_url", "").rstrip('/')
-        self.proxy = config.get("proxy", None)
-        self.logger = logger or logging.getLogger(__name__)
-        self.max_retries = config.get("max_retries", 5)
-        self.retry_delay = config.get("retry_delay", 1)
-        self.backoff_factor = config.get("backoff_factor", 2)
+    if response is not None and response.status_code in (429, 500, 502, 503, 504):
+      # 服务器错误或请求过多，建议重试
+      return True
 
-        # 创建一个异步HTTP客户端，自动带上请求头和代理配置
-        self._client = httpx.AsyncClient(proxy=self.proxy, timeout=10)
+    # 其他情况不重试
+    return False
 
-    async def __aenter__(self):
-        return self
+  async def _request_with_retry(self, method: str, url: str, params=None, json=None):
+    """
+    发送HTTP请求，带自动重试和指数退避。
 
-    async def __aexit__(self, exc_type, exc, tb):
-        await self._client.aclose()
+    Args:
+        method (str): HTTP方法，如 'GET', 'POST'。
+        url (str): 请求URL。
+        params (dict, optional): URL查询参数。
+        json (dict, optional): 请求体JSON。
 
-    def _should_retry(self, response: httpx.Response = None, exception: Exception = None) -> bool:
-        """
-        判断请求失败后是否应该重试。
-    
-        Args:
-            response (httpx.Response, optional): HTTP 响应对象。
-            exception (Exception, optional): 请求异常。
-    
-        Returns:
-            bool: 是否需要重试。
-        """
-        if exception is not None:
-            # 网络异常等，建议重试
-            return True
+    Returns:
+        dict or None: 成功时返回JSON解析结果，失败返回 None。
+    """
+    for attempt in range(self.max_retries + 1):
+      try:
+        self.logger.info(f"发送请求：{method} {url}，参数：{params}, JSON：{json}, 尝试次数：{attempt + 1}/{self.max_retries + 1}")
+        response = await self._client.request(
+          method=method,
+          url=url,
+          params=params,
+          json=json,
+        )
+        self.logger.info(f"收到响应：{response.status_code} {response.text}")
+        if response.status_code in [200, 201]:
+          # 成功返回JSON数据
+          return response.json()
 
-        if response is not None and response.status_code in (429, 500, 502, 503, 504):
-            # 服务器错误或请求过多，建议重试
-            return True
+        if not self._should_retry(response=response):
+          self.logger.error(f"请求失败且不可重试，状态码：{response.status_code}，URL：{url}")
+          return None
 
-        # 其他情况不重试
-        return False
-
-    async def _request_with_retry(self, method: str, url: str, params=None, json=None):
-        """
-        发送HTTP请求，带自动重试和指数退避。
-    
-        Args:
-            method (str): HTTP方法，如 'GET', 'POST'。
-            url (str): 请求URL。
-            params (dict, optional): URL查询参数。
-            json (dict, optional): 请求体JSON。
-    
-        Returns:
-            dict or None: 成功时返回JSON解析结果，失败返回 None。
-        """
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = await self._client.request(
-                    method=method,
-                    url=url,
-                    params=params,
-                    json=json,
-                )
-
-                if response.status_code in [200, 201]:
-                    # 成功返回JSON数据
-                    return response.json()
-
-                if not self._should_retry(response=response):
-                    self.logger.error(f"请求失败且不可重试，状态码：{response.status_code}，URL：{url}")
-                    return None
-
-                self.logger.warning(
-                    f"请求失败（状态码：{response.status_code}），"
-                    f"第 {attempt + 1}/{self.max_retries} 次重试，URL：{url}"
-                )
-
-            except httpx.RequestError as e:
-                self.logger.warning(
-                    f"请求异常：{str(e)}，"
-                    f"第 {attempt + 1}/{self.max_retries} 次重试，URL：{url}"
-                )
-
-            # 如果不是最后一次重试，按指数退避等待
-            if attempt < self.max_retries:
-                delay = self.retry_delay * (self.backoff_factor ** attempt)
-                await asyncio.sleep(delay)
-
-        self.logger.error(f"所有重试失败，URL：{url}")
-        return None
-
-    async def close(self):
-        """
-        关闭异步HTTP客户端，释放资源。
-        """
-        await self._client.aclose()
-
-    async def locate_ip(self, ip: str = None) -> Any | None:
-        """
-        IP定位接口
-        https://lbs.amap.com/api/webservice/guide/api/ipconfig
-    
-        Args:
-            ip (str, optional): 要查询的 IP，若为空，则使用请求方公网 IP。
-    
-        Returns:
-            dict: 定位结果，若失败则返回 None。
-        """
-        url = f"{self.base_url}/v3/ip"
-        params = {
-            "key": self.api_key,
-        }
-        if ip:
-            params["ip"] = ip
-
-        result = await self._request_with_retry(
-            method="GET",
-            url=url,
-            params=params
+        self.logger.warning(
+          f"请求失败（状态码：{response.status_code}），"
+          f"第 {attempt + 1}/{self.max_retries} 次重试，URL：{url}"
         )
 
-        if result and result.get("status") == "1":
-            return result
-        else:
-            self.logger.error(f"IP定位失败: {result}")
-            return None
-
-    async def search_nearby(self, location: str, keywords: str = "", types: str = "", radius: int = 1000, page_num: int = 1, page_size: int = 20) -> dict | None:
-        """
-        周边搜索（新版 POI）
-        https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch#t4
-    
-        Args:
-            location (str): 中心点经纬度，格式为 "lng,lat"
-            keywords (str, optional): 搜索关键词
-            types (str, optional): POI 分类
-            radius (int, optional): 搜索半径（米），最大 50000，默认 1000
-            page_num (int, optional): 页码，默认 1
-            page_size (int, optional): 每页数量，默认 20，最大 25
-    
-        Returns:
-            dict | None: 搜索结果，失败时返回 None
-        """
-        url = f"{self.base_url}/v5/place/around"
-        params = {
-            "key": self.api_key,
-            "location": location,
-            "keywords": keywords,
-            "types": types,
-            "radius": radius,
-            "page_num": page_num,
-            "page_size": page_size,
-        }
-
-        result = await self._request_with_retry(
-            method="GET",
-            url=url,
-            params=params,
+      except httpx.RequestError as e:
+        self.logger.warning(
+          f"请求异常：{str(e)}，"
+          f"第 {attempt + 1}/{self.max_retries} 次重试，URL：{url}"
         )
 
-        if result and result.get("status") == "1":
-            return result
-        else:
-            self.logger.error(f"周边搜索失败: {result}")
-            return None
+      # 如果不是最后一次重试，按指数退避等待
+      if attempt < self.max_retries:
+        delay = self.retry_delay * (self.backoff_factor ** attempt)
+        await asyncio.sleep(delay)
 
+    self.logger.error(f"所有重试失败，URL：{url}")
+    return None
+
+  async def close(self):
+    """
+    关闭异步HTTP客户端，释放资源。
+    """
+    await self._client.aclose()
+
+  async def locate_ip(self, ip: str = None) -> Any | None:
+    """
+    IP定位接口
+    https://lbs.amap.com/api/webservice/guide/api/ipconfig
+
+    Args:
+        ip (str, optional): 要查询的 IP，若为空，则使用请求方公网 IP。
+
+    Returns:
+        dict: 定位结果，若失败则返回 None。
+    """
+    url = f"{self.base_url}/v3/ip"
+    params = {
+      "key": self.api_key,
+    }
+    if ip:
+      params["ip"] = ip
+
+    result = await self._request_with_retry(
+      method="GET",
+      url=url,
+      params=params
+    )
+
+    if result and result.get("status") == "1":
+      return result
+    else:
+      self.logger.error(f"IP定位失败: {result}")
+      return None
+
+  async def search_nearby(self, location: str, keywords: str = "", types: str = "", radius: int = 1000, page_num: int = 1, page_size: int = 20) -> dict | None:
+    """
+    周边搜索（新版 POI）
+    https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch#t4
+
+    Args:
+        location (str): 中心点经纬度，格式为 "lng,lat"
+        keywords (str, optional): 搜索关键词
+        types (str, optional): POI 分类
+        radius (int, optional): 搜索半径（米），最大 50000，默认 1000
+        page_num (int, optional): 页码，默认 1
+        page_size (int, optional): 每页数量，默认 20，最大 25
+
+    Returns:
+        dict | None: 搜索结果，失败时返回 None
+    """
+    url = f"{self.base_url}/v5/place/around"
+    params = {
+      "key": self.api_key,
+      "location": location,
+      "keywords": keywords,
+      "types": types,
+      "radius": radius,
+      "page_num": page_num,
+      "page_size": page_size,
+    }
+
+    result = await self._request_with_retry(
+      method="GET",
+      url=url,
+      params=params,
+    )
+
+    if result and result.get("status") == "1":
+      return result
+    else:
+      self.logger.error(f"周边搜索失败: {result}")
+      return None
 ```
 
 代码中实现了：
@@ -661,9 +669,12 @@ touch src/build_mcp/services/server.py
 
 ```python
 import os
-from typing import Any, Dict
+from typing import Annotated
+from typing import Any, Dict, Generic, Optional, TypeVar
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel
+from pydantic import Field
 
 from build_mcp.common.config import load_config
 from build_mcp.common.logger import get_logger
@@ -673,64 +684,123 @@ from build_mcp.services.gd_sdk import GdSDK
 env_api_key = os.getenv("API_KEY")
 config = load_config("config.yaml")
 if env_api_key:
-    config["api_key"] = env_api_key
+  config["api_key"] = env_api_key
+
+# 初始化 FastMCP 服务
 mcp = FastMCP("amap-maps", description="高德地图 MCP 服务", version="1.0.0")
-sdk = GdSDK(config=config, logger=get_logger(name="gd_sdk", log_file="gd_sdk.log", log_level=config.get("log_level", "INFO")))
-logger = get_logger(name="amap-maps", log_file="amap_maps.log", log_level=config.get("log_level", "INFO"))
+sdk = GdSDK(config=config, logger=get_logger(name="gd_sdk"))
+logger = get_logger(name="amap-maps")
+
+# 定义通用的 API 响应模型
+T = TypeVar("T")
 
 
-@mcp.tool(name="locate_ip", description="根据 IP 地址定位位置")
-async def locate_ip(ip="") -> Dict[str, Any]:
-    """
-    根据 IP 地址定位位置。
-  
-    Args:
-        ip (str): 要定位的 IP 地址。
-  
-    Returns:
-        dict: 包含定位结果的字典。
-    """
-    logger.info(f"Locating IP: {ip}")
-    try:
-        result = await sdk.locate_ip(ip)
-        if not result:
-            return {"error": "get locate ip result is empty , please check your log."}
-        logger.info(f"Locate IP result: {result}")
-        return result
-    except Exception as e:
-        logger.error(f"Error locating IP {ip}: {e}")
-        return {"error": str(e)}
+class ApiResponse(BaseModel, Generic[T]):
+  success: bool
+  data: Optional[T] = None
+  error: Optional[str] = None
+  meta: Optional[Dict[str, Any]] = None
+
+  @classmethod
+  def ok(cls, data: T, meta: Dict[str, Any] = None) -> "ApiResponse[T]":
+    return cls(success=True, data=data, meta=meta)
+
+  @classmethod
+  def fail(cls, error: str, meta: Dict[str, Any] = None) -> "ApiResponse[None]":
+    return cls(success=False, error=error, meta=meta)
 
 
-@mcp.tool(name="search_nearby", description="周边搜索")
-async def search_nearby(location: str, keywords: str = "", types: str = "", radius: int = 1000, page_num: int = 1, page_size: int = 20) -> Dict[str, Any]:
-    """
-     周边搜索。
-  
-     Args:
-         location (str): 中心点经纬度，格式为 "lng,lat"。
-         keywords (str, optional): 搜索关键词，默认为空。
-         types (str, optional): POI 分类，默认为空。
-         radius (int, optional): 搜索半径（米），最大 50000，默认为 1000。
-         page_num (int, optional): 页码，默认为 1。
-         page_size (int, optional): 每页数量，最大 25，默认为 10。
-  
-     Returns:
-         dict: 包含搜索结果的字典。
-    """
-    logger.info(f"Searching nearby: location={location}, keywords={keywords}, types={types}, radius={radius}, page_num={page_num}, page_size={page_size}")
-    try:
-        result = await sdk.search_nearby(location=location, keywords=keywords, types=types, radius=radius, page_num=page_num, page_size=page_size)
-        if not result:
-            return {"error": "search nearby result is empty , please check your log."}
-        logger.info(f"Search nearby result: {result}")
-        return result
-    except Exception as e:
-        logger.error(f"Error searching nearby: {e}")
-        return {"error": str(e)}
+# 定义 Prompt
+@mcp.prompt(name="assistant", description="高德地图智能导航助手，支持IP定位、周边POI查询等")
+def amap_assistant(query: str) -> str:
+  return (
+    "你是高德地图智能导航助手，精通 IP 定位 和 周边POI查询。请你根据用户的需求获取调取工具，获取用户需要的相关信息。\n"
+    "## 调用工具的步骤：\n"
+    "1. 调用 `locate_ip` 工具到获取用户的经纬度。\n"
+    "2. 若成功获取经纬度，使用该经纬度调用 `search_nearby` 工具，结合搜索关键词进行周边信息的搜索。\n"
+    "## 注意事项：\n"
+    "- 不要主动要求用户提供经纬度信息，直接使用 `locate_ip` 工具获取。\n"
+    "- 如果用户的需求中包含经纬度信息，可以直接使用该信息进行周边搜索。\n"
+    f"用户的需求为：\n\n {query}。\n"
+  )
 
 
+@mcp.tool(name="locate_ip", description="获取用户的 IP 地址定位信息，返回省市区经纬度等信息。")
+async def locate_ip(ip: Annotated[Optional[str], Field(description="用户的ip地址")] = None) -> ApiResponse:
+  """
+  根据 IP 地址定位位置。
+
+  Args:
+      ip (str): 要定位的 IP 地址。
+
+  Returns:
+      dict: 包含定位结果的字典。
+  """
+  logger.info(f"Locating IP: {ip}")
+  try:
+    result = await sdk.locate_ip(ip)
+    if not result:
+      ApiResponse.fail("定位结果为空，请检查日志，系统异常请检查相关日志，日志默认路径为/var/log/build_mcp。")
+    logger.info(f"Locate IP result: {result}")
+    return ApiResponse.ok(data=result, meta={"ip": ip})
+  except Exception as e:
+    logger.error(f"Error locating IP {ip}: {e}")
+    return ApiResponse.fail(str(e))
+
+
+@mcp.tool(name="search_nearby", description="根据经纬度和关键词进行周边搜索，返回指定半径内的 POI 列表。")
+async def search_nearby(
+        location: Annotated[str, Field(description="中心点经纬度，格式为 'lng,lat'，如 '116.397128,39.916527'")],
+        keywords: Annotated[str, Field(description="搜索关键词，例如: '餐厅'。", min_length=0)] = "",
+        types: Annotated[str, Field(description="POI 分类码，多个分类用逗号分隔")] = "",
+        radius: Annotated[int, Field(description="搜索半径（米），最大50000", ge=0, le=50000)] = 1000,
+        page_num: Annotated[int, Field(description="页码，从1开始", ge=1)] = 1,
+        page_size: Annotated[int, Field(description="每页数量，最大25", ge=1, le=25)] = 20,
+) -> ApiResponse:
+  """
+   周边搜索。
+
+   Args:
+       location (str): 中心点经纬度，格式为 "lng,lat"。
+       keywords (str, optional): 搜索关键词，默认为空。
+       types (str, optional): POI 分类，默认为空。
+       radius (int, optional): 搜索半径（米），最大 50000，默认为 1000。
+       page_num (int, optional): 页码，默认为 1。
+       page_size (int, optional): 每页数量，最大 25，默认为 10。
+
+   Returns:
+       dict: 包含搜索结果的字典。
+  """
+  logger.info(f"Searching nearby: location={location}, keywords={keywords}, types={types}, radius={radius}, page_num={page_num}, page_size={page_size}")
+  try:
+    result = await sdk.search_nearby(location=location, keywords=keywords, types=types, radius=radius, page_num=page_num, page_size=page_size)
+    if not result:
+      return ApiResponse.fail("搜索结果为空，请检查日志，系统异常请检查相关日志，日志默认路径为/var/log/build_mcp。")
+    logger.info(f"Search nearby result: {result}")
+    return ApiResponse.ok(data=result, meta={
+      "location": location,
+      "keywords": keywords,
+      "types": types,
+      "radius": radius,
+      "page_num": page_num,
+      "page_size": page_size
+    })
+  except Exception as e:
+    logger.error(f"Error searching nearby: {e}")
+    return ApiResponse.fail(str(e))
 ```
+
+代码中我们封装了统一的响应类，提供了两个工具函数：
+- `locate_ip`：根据 IP 地址获取地理位置
+- `search_nearby`：根据经纬度和关键词进行周边搜索
+
+**需要注意的是代码中Annotated类型是必不可少的，这样能让LLM通过元信息更加精准地调用工具。
+目前看到大部分开发者开发的MCP服务都没有这种意识，只是单纯地定义工具，其实效果非常糟糕的。**
+
+**同时我们编写了一个prompt，这个prompt会提供在对话上下文中，是非常重要的一点，也是很多开发者并没有意识到的。
+AI时代，我们不仅要写得好代码，更要学会如何对提示词进行打磨**
+
+其实文章主要核心在以上这部分代码，请认真去理解这部分信息。
 
 至此，我们已经完成了 MCP 服务的核心功能实现。接下来，我们需要编写服务入口，启动 MCP 服务。
 
@@ -902,7 +972,7 @@ Inspector是官方提供的一个MCP服务调试工具，可以通过它来启�
 
 ```shell
 # 使用Inspector调试stdio协议的MCP服务
-API_KEY=3a1391561548f8a8f464e82d235f64ce mcp dev src/build_mcp/__init__.py
+API_KEY=你的KEY mcp dev src/build_mcp/__init__.py
 ```
 
 ## 编写Makefile
@@ -1008,25 +1078,61 @@ setup: clean install test
     }
 }
 ```
-## 发布包到PyPI
-在完成开发和测试后，我们可以将项目打包并发布到 PyPI 上，供其他人使用。
+⚠ 要注意本地UV环境，如果安装了多个UV可能会导致环境混乱，这是开发过程中比较头疼的一点，要自己注意。
 
-### 打包项目
+### 配置Streamable-HTTP协议的MCP服务
+
+#### 启动项目
 ```shell
-uv run hatch build
+make streamable-http
 ```
 
-### 发布到 PyPI
-首先需要在 PyPI 上创建一个账号，并生成一个 API Token。然后可以使用以下命令将包发布到 PyPI：
-
 ```shell
-uv run hatch publish --repository pypi
+$ make streamable-http
+Starting MCP service with streamable-http protocol...
+uv run build_mcp streamable-http
+[2025-06-26 15:01:33,775] INFO - Logger 初始化完成，写入文件：/var/log/build_mcp\gd_sdk.log
+[2025-06-26 15:01:33,839] INFO - Logger 初始化完成，写入文件：/var/log/build_mcp\amap-maps.log
+[2025-06-26 15:01:33,847] INFO - Logger 初始化完成，写入文件：/var/log/build_mcp\app.log
+[2025-06-26 15:01:33,848] INFO - 🚀 Starting MCP server with transport type: streamable-http
+INFO:     Started server process [6064]
+INFO:     Waiting for application startup.
+[06/26/25 15:01:33] INFO     StreamableHTTP session manager started                                                                                                                                     streamable_http_manager.py:109
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+
+```
+启动成功后会在8000端口启动一个HTTP服务。
+
+
+#### 客户端配置
+```shell
+{
+    "mcpServers": {
+        "build_mcp_http": {
+            "url": "http://localhost:8000/mcp"
+        }
+    }
+}
 ```
 
-### 发布到 Test PyPI
-如果你想先在 Test PyPI 上测试，可以使用以下命令：
+## 总结
+本文介绍了如何从零开始构建一个高德地图的MCP服务，涵盖了以下内容：
+- MCP服务的基本概念和配置
+- 如何使用高德地图API进行IP定位和周边搜索
+- 如何编写MCP服务的核心功能，包括配置管理、日志系统和高德地图SDK
+- 如何编写MCP服务的主程序和入口
+- 如何调试MCP服务，包括使用Inspector和编写测试代码
+- 如何使用Makefile管理项目命令
+- 如何配置MCP客户端连接到我们的服务
 
-```shell
+行文至此结束，祝大家学习愉快！如果你有任何问题或建议，请提交issue或pull request到[GitHub仓库](https://github.com/869413421/build_mcp)
+
+
+## 参考资料
+- [Model Context Protocol (MCP) 官方文档](https://modelcontextprotocol.io/docs/)
+- [高德地图API文档](https://lbs.amap.com/api/webservice/guide/api/ipconfig)
+- [官方开发SDK](https://github.com/modelcontextprotocol/python-sdk/tree/main)
   
 
 

@@ -12,3 +12,5 @@ max_retries: 5
 retry_delay: 1
 # 指数退避因子
 backoff_factor: 2
+# 日志文件路径
+log_dir: /var/log/build_mcp

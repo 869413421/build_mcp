@@ -29,7 +29,7 @@ class GdSDK:
         self.api_key = config.get("api_key", "")
         self.base_url = config.get("base_url", "").rstrip('/')
         self.proxy = config.get("proxy", None)
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = logger
         self.max_retries = config.get("max_retries", 5)
         self.retry_delay = config.get("retry_delay", 1)
         self.backoff_factor = config.get("backoff_factor", 2)
@@ -80,13 +80,14 @@ class GdSDK:
         """
         for attempt in range(self.max_retries + 1):
             try:
+                self.logger.info(f"发送请求：{method} {url}，参数：{params}, JSON：{json}, 尝试次数：{attempt + 1}/{self.max_retries + 1}")
                 response = await self._client.request(
                     method=method,
                     url=url,
                     params=params,
                     json=json,
                 )
-
+                self.logger.info(f"收到响应：{response.status_code} {response.text}")
                 if response.status_code in [200, 201]:
                     # 成功返回JSON数据
                     return response.json()

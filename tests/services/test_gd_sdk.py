@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 
 from build_mcp.services.gd_sdk import GdSDK
+from build_mcp.common.logger import get_logger
 
 API_KEY = os.getenv("API_KEY", "your_api_key_here")  # 从环境变量获取 API Key，或使用默认值
 
@@ -16,7 +17,7 @@ async def sdk():
         "api_key": API_KEY,
         "max_retries": 2,
     }
-    async with GdSDK(config, logger=logging.getLogger("GdSDK")) as client:
+    async with GdSDK(config, logger=get_logger("gd_sdk_test")) as client:
         yield client
 
 
